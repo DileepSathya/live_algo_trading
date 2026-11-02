@@ -1,2 +1,4 @@
 .venv/
 .env
+access_token.txt
+private_data/

@@ -2,3 +2,5 @@ playwright
 pyotp
 requests
 python-dotenv
+upstox-python-sdk
+chromium
