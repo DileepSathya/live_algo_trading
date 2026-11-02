@@ -1,0 +1,4 @@
+playwright
+pyotp
+requests
+python-dotenv
