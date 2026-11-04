@@ -4,3 +4,4 @@ requests
 python-dotenv
 upstox-python-sdk
 chromium
+websockets
