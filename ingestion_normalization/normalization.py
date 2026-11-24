@@ -1,9 +1,11 @@
 """Normalize decoded Upstox market data and replay raw JSONL captures."""
 
 import argparse
+import hashlib
 import json
 import re
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,6 +18,30 @@ else:
 
 DATA_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# Persist this namespace across releases to keep replay identities stable.
+EVENT_NAMESPACE = uuid.UUID("d53b2750-56dc-4ef9-89de-b6574db1b128")
+
+
+def capture_identity(record):
+    """Use the stored receipt identity, with a deterministic legacy fallback."""
+    if "capture_id" in record:
+        return str(uuid.UUID(record["capture_id"]))
+    payload = json.dumps(
+        record["data"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    name = json.dumps(["legacy", record["received_at"], digest], separators=(",", ":"))
+    return str(uuid.uuid5(EVENT_NAMESPACE, name))
+
+
+def assign_event_id(event, capture_id):
+    entity = event.get("source_instrument_id", event["market_segment"])
+    name = json.dumps(
+        [event["source"], capture_id, event["event_type"], entity],
+        separators=(",", ":"), ensure_ascii=False,
+    )
+    event["capture_id"] = capture_id
+    event["event_id"] = str(uuid.uuid5(EVENT_NAMESPACE, name))
 
 
 def utc_milliseconds(value):
@@ -72,6 +98,7 @@ def normalize_upstox(record, context="Upstox"):
     received_at = datetime.fromisoformat(record["received_at"].replace("Z", "+00:00"))
     if received_at.utcoffset() is None:
         raise ValueError("received_at requires a timezone")
+    capture_id = capture_identity(record)
     base = {
         "source": "upstox",
         "schema_version": 1,
@@ -92,6 +119,7 @@ def normalize_upstox(record, context="Upstox"):
                 else:
                     event = normalize_quote(base, key, payload)
                 validate_event(event)
+                assign_event_id(event, capture_id)
             except DATA_ERRORS as exc:
                 print(f"{context}: rejected {key!r}: {exc}", file=sys.stderr)
                 continue

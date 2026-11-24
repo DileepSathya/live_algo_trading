@@ -133,6 +133,7 @@ def get_authorized_websocket_url(token):
 def save_market_data(message):
 
     record = {
+        "capture_id": str(uuid.uuid4()),
         "received_at": datetime.now(
             timezone.utc
         ).isoformat(),
