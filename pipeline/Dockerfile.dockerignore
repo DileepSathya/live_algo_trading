@@ -1,0 +1,6 @@
+**
+!pipeline/
+!pipeline/*.py
+!pipeline/requirements.txt
+!ingestion_normalization/
+!ingestion_normalization/*.py

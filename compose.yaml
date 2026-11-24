@@ -1,0 +1,103 @@
+x-worker: &worker
+  build:
+    context: .
+    dockerfile: pipeline/Dockerfile
+  restart: unless-stopped
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://127.0.0.1:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "127.0.0.1:29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  topics:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for topic in market.quotes.v1 market.status.v1; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions 1 --replication-factor 1
+        done
+
+  timescaledb:
+    image: timescale/timescaledb:2.18.2-pg16
+    environment:
+      POSTGRES_DB: market
+      POSTGRES_USER: market
+      POSTGRES_PASSWORD: ${MARKET_DB_PASSWORD:-local-market}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./pipeline/schema.sql:/docker-entrypoint-initdb.d/10-market.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-U", "market", "-d", "market"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  db-viewer:
+    image: adminer:5
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: timescaledb
+    ports:
+      - "127.0.0.1:8081:8080"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  publisher:
+    <<: *worker
+    profiles: ["file-replay"]
+    command: ["python", "-m", "pipeline.publisher"]
+    depends_on:
+      topics:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CAPTURE_FILE: /captures/live_market_data.jsonl
+      CHECKPOINT_FILE: /state/publisher.json
+    volumes:
+      - ./market_data:/captures:ro
+      - publisher-state:/state
+
+  timescale-writer:
+    <<: *worker
+    command: ["python", "-m", "pipeline.writer"]
+    depends_on:
+      topics:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PGHOST: timescaledb
+      PGDATABASE: market
+      PGUSER: market
+      PGPASSWORD: ${MARKET_DB_PASSWORD:-local-market}
+
+volumes:
+  kafka-data:
+  db-data:
+  publisher-state:

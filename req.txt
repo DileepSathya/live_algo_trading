@@ -5,3 +5,4 @@ python-dotenv
 upstox-python-sdk
 chromium
 websockets
+confluent-kafka>=2.6,<3

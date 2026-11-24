@@ -1,8 +1,8 @@
 
 import sys
 import json
+import os
 import uuid
-import time
 import asyncio
 import socket
 import ssl
@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 import requests
 import websockets
+from dotenv import load_dotenv
 
 from google.protobuf.json_format import MessageToDict
 from upstox_client.feeder.proto import MarketDataFeedV3_pb2
@@ -27,15 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if __package__ in (None, ""):
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ingestion_normalization.normalization import encode_events
+from pipeline.publisher import create_producer, publish_capture
 
-TOKEN_FILE = PROJECT_ROOT / "private_data" / "access_token.txt"
-
-DATA_DIR = PROJECT_ROOT / "market_data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-OUTPUT_FILE = DATA_DIR / "live_market_data.jsonl"
-NORMALIZED_OUTPUT_FILE = DATA_DIR / "normalized_market_data.jsonl"
+PRIVATE_DIR = PROJECT_ROOT / "private_data"
+load_dotenv(PRIVATE_DIR / ".env")
+TOKEN_FILE = PRIVATE_DIR / os.getenv("TOKEN_FILE", "access_token.txt")
 
 AUTH_URL = (
     "https://api.upstox.com/v3/feed/market-data-feed/authorize"
@@ -127,56 +124,6 @@ def get_authorized_websocket_url(token):
 
 
 # ==========================================
-# SAVE MARKET DATA
-# ==========================================
-
-def save_market_data(message):
-
-    record = {
-        "capture_id": str(uuid.uuid4()),
-        "received_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-
-        "data": message
-    }
-
-    try:
-
-        with OUTPUT_FILE.open(
-            "a",
-            encoding="utf-8"
-        ) as file:
-
-            file.write(
-                json.dumps(
-                    record,
-                    ensure_ascii=False
-                ) + "\n"
-            )
-
-            file.flush()
-
-    except Exception as exc:
-
-        print("JSON storage error:", repr(exc))
-        return
-
-    try:
-        batch = encode_events(record)
-    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
-        print("Market data normalization error:", repr(exc))
-        return
-
-    if batch:
-        try:
-            with NORMALIZED_OUTPUT_FILE.open("a", encoding="utf-8") as file:
-                file.write(batch)
-        except OSError as exc:
-            print("Normalized JSON storage error:", repr(exc))
-
-
-# ==========================================
 # DECODE PROTOBUF
 # ==========================================
 
@@ -193,7 +140,11 @@ def decode_protobuf(binary_message):
 # WEBSOCKET CONNECTION
 # ==========================================
 
-async def connect_websocket(token):
+class PublishError(RuntimeError):
+    pass
+
+
+async def connect_websocket(token, producer):
 
     # Obtain a fresh authorized URL for every connection.
     ws_url = get_authorized_websocket_url(token)
@@ -243,22 +194,21 @@ async def connect_websocket(token):
 
                 decoded_data = decode_protobuf(message)
 
-                save_market_data(decoded_data)
-
-                print(
-                    "LIVE DATA:",
-                    json.dumps(
-                        decoded_data,
-                        ensure_ascii=False
-                    )
-                )
-
             except Exception as exc:
+                print("Message decoding error:", repr(exc))
+                continue
 
-                print(
-                    "Message decoding error:",
-                    repr(exc)
-                )
+            capture = {
+                "capture_id": str(uuid.uuid4()),
+                "received_at": datetime.now(timezone.utc).isoformat(),
+                "data": decoded_data,
+            }
+            # Wait for acknowledgement before taking the next frame.
+            try:
+                await asyncio.to_thread(publish_capture, producer, capture)
+            except Exception as exc:
+                raise PublishError("Kafka delivery failed for capture " + capture["capture_id"]) from exc
+            print("LIVE DATA:", json.dumps(decoded_data, ensure_ascii=False))
 
     print("\nWebSocket connection closed.")
 
@@ -275,8 +225,7 @@ async def main():
 
     validate_access_token(token)
 
-    print("\nOutput file:", OUTPUT_FILE)
-    print("Normalized output file:", NORMALIZED_OUTPUT_FILE)
+    producer = create_producer(os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:29092"))
 
     print("\nStarting Upstox Market Data Feed V3...")
     print("Press CTRL+C to stop.\n")
@@ -285,12 +234,15 @@ async def main():
 
         try:
 
-            await connect_websocket(token)
+            await connect_websocket(token, producer)
 
             print(
                 "\nConnection ended. "
                 "Preparing to reconnect..."
             )
+
+        except PublishError:
+            raise
 
         except requests.exceptions.HTTPError as exc:
 
@@ -354,4 +306,3 @@ if __name__ == "__main__":
     finally:
 
         print("\nApplication terminated.")
-        print("Data file:", OUTPUT_FILE)

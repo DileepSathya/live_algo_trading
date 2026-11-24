@@ -15,6 +15,7 @@ Optional:
 Use only with your own Upstox account and in accordance with Upstox's terms.
 """
 
+import argparse
 import asyncio
 import os
 import threading
@@ -299,8 +300,8 @@ async def automate_upstox_login(playwright):
         await browser.close()
 
 
-async def main():
-    cached_token = load_cached_token()
+async def main(fresh_login=False):
+    cached_token = None if fresh_login else load_cached_token()
     if cached_token and check_token_validity(cached_token):
         print(f"Valid cached access token found in {TOKEN_FILE}.")
         return
@@ -321,10 +322,15 @@ async def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Authenticate the Upstox collector.")
+    parser.add_argument("--fresh-login", action="store_true",
+                        help="Open the login browser even when a cached token exists.")
+    args = parser.parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(fresh_login=args.fresh_login))
     except KeyboardInterrupt:
         print("\nLogin cancelled.")
+        raise SystemExit(130)
     except Exception as exc:
         print(f"\nERROR: {exc}")
         raise
