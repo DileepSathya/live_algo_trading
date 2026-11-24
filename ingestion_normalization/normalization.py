@@ -3,10 +3,18 @@
 import argparse
 import json
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+if __package__:
+    from .validation import validate_event
+else:
+    from validation import validate_event
+
+
+DATA_ERRORS = (ValueError, TypeError, KeyError, AttributeError, OverflowError)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -17,11 +25,22 @@ def utc_milliseconds(value):
 
 
 def mapped_fields(data, fields):
-    return {
-        target: convert(data[source])
-        for source, target, convert in fields
-        if source in data and data[source] is not None
-    }
+    if not isinstance(data, dict):
+        raise ValueError("expected an object containing market fields")
+    result = {}
+    for source, target, convert in fields:
+        value = data.get(source)
+        if value is None:
+            continue
+        if isinstance(value, bool) or (
+            convert in (int, utc_milliseconds) and isinstance(value, float)
+            and not value.is_integer()
+        ):
+            raise ValueError(f"invalid {target}")
+        if target == "interval" and not isinstance(value, str):
+            raise ValueError("invalid candle interval")
+        result[target] = convert(value)
+    return result
 
 
 TRADE_FIELDS = (
@@ -47,50 +66,71 @@ CANDLE_FIELDS = (
 )
 
 
-def normalize_upstox(record):
+def normalize_upstox(record, context="Upstox"):
     """Yield canonical events from one decoded capture record."""
     data = record["data"]
     received_at = datetime.fromisoformat(record["received_at"].replace("Z", "+00:00"))
+    if received_at.utcoffset() is None:
+        raise ValueError("received_at requires a timezone")
     base = {
         "source": "upstox",
         "schema_version": 1,
         "received_at": received_at.astimezone(timezone.utc).isoformat(),
         **mapped_fields(data, (("currentTs", "feed_time", utc_milliseconds),)),
     }
-    for segment, status in data.get("marketInfo", {}).get("segmentStatus", {}).items():
-        yield dict(base, event_type="market_status", market_segment=segment, status=status)
-
-    for instrument, feed in data.get("feeds", {}).items():
-        full = feed.get("fullFeed", {})
-        quote = full.get("marketFF", full.get("indexFF", feed.get("firstLevelWithGreeks", feed)))
-        event = dict(base, event_type="quote_update", source_instrument_id=instrument)
-        segment, separator, identifier = instrument.partition("|")
-        if separator:
-            event["market_segment"] = segment
-            if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", identifier):
-                event["isin"] = identifier
-
-        event.update(mapped_fields(quote.get("ltpc", {}), TRADE_FIELDS))
-        event.update(mapped_fields(quote, SESSION_FIELDS))
-        depth = quote.get("marketLevel", {}).get("bidAskQuote")
-        if depth is None and "firstDepth" in quote:
-            depth = [quote["firstDepth"]]
-        if depth is not None:
-            for side, prefix in (("bids", "bid"), ("asks", "ask")):
-                fields = ((prefix + "P", "price", float), (prefix + "Q", "quantity", int))
-                levels = [mapped_fields(level, fields) for level in depth]
-                event[side] = [level for level in levels if level]
-        candles = quote.get("marketOHLC", {}).get("ohlc")
-        if candles is not None:
-            event["candles"] = [mapped_fields(candle, CANDLE_FIELDS) for candle in candles]
-        yield event
+    for kind, entries in (("market_status", data.get("marketInfo", {})),
+                          ("quote_update", data.get("feeds", {}))):
+        if kind == "market_status" and isinstance(entries, dict):
+            entries = entries.get("segmentStatus", {})
+        if not isinstance(entries, dict):
+            print(f"{context}: rejected {kind}: expected an object", file=sys.stderr)
+            continue
+        for key, payload in entries.items():
+            try:
+                if kind == "market_status":
+                    event = dict(base, event_type=kind, market_segment=key, status=payload)
+                else:
+                    event = normalize_quote(base, key, payload)
+                validate_event(event)
+            except DATA_ERRORS as exc:
+                print(f"{context}: rejected {key!r}: {exc}", file=sys.stderr)
+                continue
+            yield event
 
 
-def encode_events(record):
+def normalize_quote(base, instrument, feed):
+    full = feed.get("fullFeed", {})
+    quote = full.get("marketFF", full.get("indexFF", feed.get("firstLevelWithGreeks", feed)))
+    event = dict(base, event_type="quote_update", source_instrument_id=instrument)
+    segment, separator, identifier = instrument.partition("|")
+    if not identifier.strip():
+        raise ValueError("missing instrument identifier")
+    if separator:
+        event["market_segment"] = segment
+        if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", identifier):
+            event["isin"] = identifier
+
+    event.update(mapped_fields(quote.get("ltpc", {}), TRADE_FIELDS))
+    event.update(mapped_fields(quote, SESSION_FIELDS))
+    depth = quote.get("marketLevel", {}).get("bidAskQuote")
+    if depth is None and "firstDepth" in quote:
+        depth = [quote["firstDepth"]]
+    if depth is not None:
+        for side, prefix in (("bids", "bid"), ("asks", "ask")):
+            fields = ((prefix + "P", "price", float), (prefix + "Q", "quantity", int))
+            levels = [mapped_fields(level, fields) for level in depth]
+            event[side] = levels
+    candles = quote.get("marketOHLC", {}).get("ohlc")
+    if candles is not None:
+        event["candles"] = [mapped_fields(candle, CANDLE_FIELDS) for candle in candles]
+    return event
+
+
+def encode_events(record, context="Upstox"):
     """Encode a record's events for either live storage or replay."""
     return "".join(
         json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n"
-        for event in normalize_upstox(record)
+        for event in normalize_upstox(record, context)
     )
 
 
@@ -102,11 +142,12 @@ def main():
     with args.input.open(encoding="utf-8") as source, args.output.open(
         "x", encoding="utf-8"
     ) as output:
-        try:
-            for line_number, line in enumerate(source, 1):
-                output.write(encode_events(json.loads(line)))
-        except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
-            parser.exit(1, f"{args.input}:{line_number}: {exc}\n")
+        for line_number, line in enumerate(source, 1):
+            context = f"{args.input}:{line_number}"
+            try:
+                output.write(encode_events(json.loads(line), context))
+            except DATA_ERRORS as exc:
+                print(f"{context}: rejected record: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
