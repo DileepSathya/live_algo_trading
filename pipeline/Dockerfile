@@ -4,3 +4,4 @@ COPY pipeline/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY ingestion_normalization/ ingestion_normalization/
 COPY pipeline/*.py pipeline/
+COPY pipeline/candles.sql pipeline/

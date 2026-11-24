@@ -11,7 +11,7 @@ if errorlevel 1 (
 )
 docker compose --profile file-replay stop publisher
 if errorlevel 1 goto failed
-docker compose up -d --build timescale-writer
+docker compose up -d --build timescale-writer candle-builder
 if errorlevel 1 goto failed
 "%PY%" -c "import confluent_kafka" >nul 2>&1
 if errorlevel 1 "%PY%" -m pip install "confluent-kafka>=2.6,<3"

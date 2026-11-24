@@ -1,6 +1,7 @@
 **
 !pipeline/
 !pipeline/*.py
+!pipeline/candles.sql
 !pipeline/requirements.txt
 !ingestion_normalization/
 !ingestion_normalization/*.py

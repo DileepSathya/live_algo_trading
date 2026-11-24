@@ -82,7 +82,7 @@ services:
       - ./market_data:/captures:ro
       - publisher-state:/state
 
-  timescale-writer:
+  timescale-writer: &db-worker
     <<: *worker
     command: ["python", "-m", "pipeline.writer"]
     depends_on:
@@ -96,6 +96,10 @@ services:
       PGDATABASE: market
       PGUSER: market
       PGPASSWORD: ${MARKET_DB_PASSWORD:-local-market}
+
+  candle-builder:
+    <<: *db-worker
+    command: ["python", "-m", "pipeline.candle_builder"]
 
 volumes:
   kafka-data:
