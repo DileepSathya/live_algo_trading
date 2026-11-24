@@ -3,3 +3,4 @@
 access_token.txt
 private_data/
 market_data/
+__pycache__/
