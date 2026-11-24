@@ -23,12 +23,19 @@ from upstox_client.feeder.proto import MarketDataFeedV3_pb2
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# Keep direct script invocation working alongside module invocation.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from ingestion_normalization.normalization import encode_events
+
 TOKEN_FILE = PROJECT_ROOT / "private_data" / "access_token.txt"
 
 DATA_DIR = PROJECT_ROOT / "market_data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 OUTPUT_FILE = DATA_DIR / "live_market_data.jsonl"
+NORMALIZED_OUTPUT_FILE = DATA_DIR / "normalized_market_data.jsonl"
 
 AUTH_URL = (
     "https://api.upstox.com/v3/feed/market-data-feed/authorize"
@@ -152,6 +159,20 @@ def save_market_data(message):
     except Exception as exc:
 
         print("JSON storage error:", repr(exc))
+        return
+
+    try:
+        batch = encode_events(record)
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+        print("Market data normalization error:", repr(exc))
+        return
+
+    if batch:
+        try:
+            with NORMALIZED_OUTPUT_FILE.open("a", encoding="utf-8") as file:
+                file.write(batch)
+        except OSError as exc:
+            print("Normalized JSON storage error:", repr(exc))
 
 
 # ==========================================
@@ -254,6 +275,7 @@ async def main():
     validate_access_token(token)
 
     print("\nOutput file:", OUTPUT_FILE)
+    print("Normalized output file:", NORMALIZED_OUTPUT_FILE)
 
     print("\nStarting Upstox Market Data Feed V3...")
     print("Press CTRL+C to stop.\n")
